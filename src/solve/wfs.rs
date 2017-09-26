@@ -27,6 +27,7 @@
 
 use ir::*;
 use std::collections::{HashMap, HashSet};
+use std::ops::{Index, IndexMut};
 use std::usize;
 
 pub struct WfsSolver {
@@ -140,7 +141,7 @@ struct Table {
 struct SimplifiedGoals {
     /// Something that we have to prove to be true. These are always
     /// leaf goals.
-    positive: Vec<InEnvironment<LeafGoal>>,
+    positive: Vec<InEnvironment<DomainGoal>>,
 
     /// Something that we have to **refute** (prove to be false).
     /// Note that these are HH goals, not leaf goals.
@@ -150,6 +151,11 @@ struct SimplifiedGoals {
 struct WaitingGoal {
     table_index: TableIndex,
     stack_index: StackIndex,
+}
+
+struct Minimums {
+    positive: usize,
+    negative: usize,
 }
 
 type CanonicalGoal = Canonical<InEnvironment<Goal>>;
@@ -186,37 +192,50 @@ impl WfsSolver {
 
         let mut wfs = WfsSolver { program, table, stack };
 
-        let mut pos_min = 1;
-        let mut neg_min = usize::MAX;
-        wfs.subgoal(&canonical_goal, &mut pos_min, &mut neg_min);
+        let mut minimums = Minimums { positive: 1, negative: usize::MAX };
+        wfs.subgoal_hh(&canonical_goal, &mut minimums)
     }
 
-    /// In EWFS, this is SLG_SUBGOAL. We have expanded it slightly to
-    /// account for the fact that we have richer sets of goals in
-    /// HH predicates.
-    fn subgoal(&mut self,
-               table: TableIndex,
-               initial_environment: &Arc<Environment>,
-               initial_goal: Goal,
-               pos_min: &mut usize,
-               neg_min: &mut usize) {
-        let simplified_goals = self.simplify_goal(initial_environment, initial_goal);
+    /// This is the HH-extension of SLG_SUBGOAL from EWFS. We have
+    /// expanded it slightly to account for the fact that we have
+    /// richer sets of goals in HH predicates.
+    fn subgoal_hh(&mut self,
+                  table: TableIndex,
+                  initial_environment: &Arc<Environment>,
+                  initial_goal: Goal,
+                  minimums: &mut Minimums) {
+        let simplified_goals = self.simplify_hh_goal(initial_environment, initial_goal)?;
 
         assert!(simplified_goals.negative.is_empty(),
                 "negative goals not implemented yet");
 
-        for positive_goal in simplify_goal.positive {
-            for resolvent in resolvents {
-                self.new_clause(resolvent, goal, pos_min, neg_min)
-            }
-            self.complete(goal, pos_min, neg_min)
+        for InEnvironment { environment, goal } in simplify_goal.positive {
+            self.subgoal_leaf(table, environment, goal, minimums);
         }
     }
 
-    fn simplify_goal(&mut self,
-                     initial_environment: &Arc<Environment>,
-                     initial_goal: Goal)
-                     -> Vec<SimplifiedGoals>
+    /// In EWFS, this is SLG_SUBGOAL.
+    fn subgoal_domain(&mut self,
+                      table: TableIndex,
+                      environment: &Arc<Environment>,
+                      goal: DomainGoal,
+                      minimums: &mut Minimums) {
+        let clauses = self.clauses(&environment, &goal);
+        for clause in clauses {
+            do catch {
+                self.new_clause(table, environment, goal, clause, minimums)?;
+            }
+        }
+    }
+
+    /// Simplifies an HH goal into a series of positive domain goals
+    /// and negative HH goals. This operation may fail if the HH goal
+    /// includes unifications that cannot be completed.
+    fn simplify_hh_goal(&mut self,
+                        table_index: TableIndex,
+                        initial_environment: &Arc<Environment>,
+                        initial_goal: Goal)
+                        -> Result<Vec<SimplifiedGoals>>
     {
         // A stack of higher-level goals to process.
         let mut goals = vec![(initial_environment.clone(), initial_goal)];
@@ -269,7 +288,10 @@ impl WfsSolver {
                 Goal::Not(subgoal) => {
                     simplified_goals.negative.push(InEnvironment::new(&environment, *subgoal));
                 }
-                Goal::Leaf(wc) => {
+                Goal::Leaf(LeafGoal::EqGoal(eq_goal)) => {
+                    goals.extend(self.unify(table_index, environment, eq_goal)?);
+                }
+                Goal::Leaf(LeafGoal::DomainGoal(domain_goal)) => {
                     simplified_goals.positive.push(InEnvironment::new(&environment, wc));
                 }
             }
@@ -278,63 +300,140 @@ impl WfsSolver {
         simplified_goals
     }
 
-    fn clauses(&mut self,
-               environment: &Arc<Environment>,
-               goal: &LeafGoal)
-               -> Vec<ProgramClause>
+    fn unify(&mut self,
+             table_index: TableIndex,
+             environment: &Arc<Environment>,
+             eq_goal: &EqGoal)
+             -> Result<Vec<(Arc<Environment>, Goal)>>
     {
-        
+        self.tables[table_index].unify(environment, &eq_goal.a, &eq_goal.b)
     }
 
-    /// Create obligations for the given goal in the given environment. This may
-    /// ultimately create any number of obligations.
-    pub fn push_goal(&mut self, environment: &Arc<Environment>, goal: Goal) {
-        debug!("push_goal({:?}, {:?})", goal, environment);
-        match goal {
-            Goal::Quantified(QuantifierKind::ForAll, subgoal) => {
-                let mut new_environment = environment.clone();
-                let parameters: Vec<_> =
-                    subgoal.binders
-                           .iter()
-                           .map(|pk| {
-                               new_environment = new_environment.new_universe();
-                               match *pk {
-                                   ParameterKind::Lifetime(()) => {
-                                       let lt = Lifetime::ForAll(new_environment.universe);
-                                       ParameterKind::Lifetime(lt)
-                                   }
-                                   ParameterKind::Ty(()) =>
-                                       ParameterKind::Ty(Ty::Apply(ApplicationTy {
-                                           name: TypeName::ForAll(new_environment.universe),
-                                           parameters: vec![]
-                                       })),
-                               }
-                           })
-                           .collect();
-                let subgoal = subgoal.value.subst(&parameters);
-                self.push_goal(&new_environment, subgoal);
-            }
-            Goal::Quantified(QuantifierKind::Exists, subgoal) => {
-                let subgoal = self.instantiate_in(environment.universe,
-                                                  subgoal.binders.iter().cloned(),
-                                                  &subgoal.value);
-                self.push_goal(environment, *subgoal);
-            }
-            Goal::Implies(wc, subgoal) => {
-                let new_environment = &environment.add_clauses(wc);
-                self.push_goal(new_environment, *subgoal);
-            }
-            Goal::And(subgoal1, subgoal2) => {
-                self.push_goal(environment, *subgoal1);
-                self.push_goal(environment, *subgoal2);
-            }
-            Goal::Not(subgoal) => {
-                let in_env = InEnvironment::new(environment, *subgoal);
-                self.obligations.push(Obligation::Refute(in_env));
-            }
-            Goal::Leaf(wc) => {
-                self.obligations.push(Obligation::Prove(InEnvironment::new(environment, wc)));
-            }
+    fn clauses(&mut self,
+               environment: &Arc<Environment>,
+               goal: &DomainGoal)
+               -> Vec<ProgramClause>
+    {
+        let environment_clauses =
+            environment.clauses
+                       .iter()
+                       .filter(|domain_goal| domain_goal.could_match(goal))
+                       .map(|domain_goal| domain_goal.clone().into_program_clause());
+
+        let program_clauses =
+            self.program.program_clauses.iter()
+                                        .filter(|clause| clause.could_match(goal));
+
+        environment_clauses.chain(program_clauses).collect()
+    }
+
+    fn new_clause(&mut self,
+                  table_index: TableIndex,
+                  environment: &Arc<Environment>,
+                  goal: DomainGoal,
+                  clause: ProgramClause,
+                  minimums: &mut Minimums)
+                  -> Result<()>
+    {
+        // First, compute the SLG resolvent of goal + clause. This
+        // operation may fail, in which case the new-clause fails.
+        let goals = self.slg_resolve(table_index, environment, goal, clause)?;
+
+        // Now we begin with SLG_NEWCLAUSE proper. What the text calls
+        // G is basically the list of clauses in `goals`.
+        if goals.is_empty() {
+            self.slg_answer()
+        } else {
+            
         }
+    }
+
+    fn slg_resolvent(&mut self,
+                     table_index: TableIndex,
+                     environment: &Arc<Environment>,
+                     goal: DomainGoal,
+                     clause: &Binders<ProgramClauseImplication>)
+                     -> Result<Vec<InEnvironment<Goal>>>
+    {
+        // From EWFS:
+        //
+        // Let G be an X-clause A :- D | L1,...Ln, where N > 0, and Li be selected atom.
+        //
+        // Let C be an X-clause with no delayed literals. Let
+        //
+        //     C' = A' :- L'1...L'n
+        //
+        // be a variant of C such that G and C' have no variables in
+        // common.
+        //
+        // Let Li and A' be unified with MGU S.
+        //
+        // Then:
+        //
+        //     S(A :- D | L1...Li-1, L1'...Lm', Li+1...Ln)
+        //
+        // is the SLG resolvent of G with C.
+
+        // Relating the above description to our situation:
+        //
+        // - `goal` is the selected literal Li.
+        // - `clause` is C, except with binders for any existential variables.
+
+        let table = &mut self.tables[table_index];
+
+        // Clause here is now C' in the description above.
+        let clause = table.instantiate_binders(&clause);
+
+        // We have now unified Li and C'; unlike in the description above, this yields
+        // some extra "conditions" that we can lump in with L1'..Lm', effectively.
+        let mut subgoals = table.unify(environment, &goal, clause.consequence)?;
+        subgoals.extend(clause.conditions.into_iter().map(|g| InEnvironment::new(environment, g)));
+
+        // Return the union of L1'...Lm' with those extra conditions. We are assuming
+        // in this routine that the selected literal Li was the only literal.
+        Ok(subgoals)
+    }
+}
+
+impl Index<TableIndex> for Tables {
+    type Output = Table;
+
+    fn index(&self, index: TableIndex) -> &Table {
+        &self.tables[index.value]
+    }
+}
+
+impl IndexMut<TableIndex> for Tables {
+    fn index_mut(&mut self, index: TableIndex) -> &mut Table {
+        &mut self.tables[index.value]
+    }
+}
+
+impl Table {
+    /// Unify `a` and `b`. If this succeeds, it returns a series of
+    /// sub-goals that must then be processed as a result.
+    fn unify<T>(&mut self,
+                environment: &Arc<Environment>,
+                a: &T,
+                b: &T)
+                -> Result<Vec<(Arc<Environment>, Goal)>>
+        where T: ?Sized + Zip + Debug
+    {
+        let table = &mut self.tables[table_index];
+        let UnificationResult { goals, constraints, cannot_prove } =
+            table.infer.unify(environment, a)?;
+
+        assert!(constraints.is_empty(), "Not yet implemented: region constraints");
+        assert!(!cannot_prove, "Not yet implemented: cannot_prove");
+
+        Ok(goals.into_iter().map(|goal| (environment.clone(), goal)).collect())
+    }
+
+    /// Instantiate `value`, replacing all the bound variables with
+    /// free inference variables.
+    fn instantiate_binders<T>(&mut self, value: &Binders<T>) -> T::Result
+        where T: Fold
+    {
+        self.infer.instantiate(&value.binders, &value.value)
     }
 }
