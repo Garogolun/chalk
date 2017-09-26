@@ -17,11 +17,14 @@ impl InferenceTable {
     {
         debug_heading!("unify(a={:?}\
                      ,\n      b={:?})", a, b);
-        let mut unifier = Unifier::new(self, environment);
-        match Zip::zip_with(&mut unifier, a, b) {
-            Ok(()) => unifier.commit(),
+        let snapshot = self.snapshot();
+        match Unifier::new(self, environment).unify(a, b) {
+            Ok(r) => {
+                self.commit(snapshot);
+                Ok(r)
+            }
             Err(e) => {
-                unifier.rollback();
+                self.rollback_to(snapshot);
                 Err(e)
             }
         }
@@ -31,7 +34,6 @@ impl InferenceTable {
 struct Unifier<'t> {
     table: &'t mut InferenceTable,
     environment: &'t Arc<Environment>,
-    snapshot: InferenceSnapshot,
     goals: Vec<InEnvironment<LeafGoal>>,
     constraints: Vec<InEnvironment<Constraint>>,
     cannot_prove: bool,
@@ -51,19 +53,22 @@ pub struct UnificationResult {
 
 impl<'t> Unifier<'t> {
     fn new(table: &'t mut InferenceTable, environment: &'t Arc<Environment>) -> Self {
-        let snapshot = table.snapshot();
         Unifier {
             environment: environment,
             table: table,
-            snapshot: snapshot,
             goals: vec![],
             constraints: vec![],
             cannot_prove: false,
         }
     }
 
-    fn commit(self) -> Result<UnificationResult> {
-        self.table.commit(self.snapshot);
+    /// The main entry point for the `Unifier` type and really the
+    /// only type meant to be called externally. Performs a
+    /// unification of `a` and `b` and returns the Unification Result.
+    fn unify<T>(mut self, a: &T, b: &T) -> Result<UnificationResult>
+        where T: ?Sized + Zip + Debug,
+    {
+        Zip::zip_with(&mut self, a, b)?;
         Ok(UnificationResult {
             goals: self.goals,
             constraints: self.constraints,
@@ -71,8 +76,20 @@ impl<'t> Unifier<'t> {
         })
     }
 
-    fn rollback(self) {
-        self.table.rollback_to(self.snapshot);
+    /// When we encounter a "sub-unification" problem that is in a distinct
+    /// environment, we invoke this routine.
+    fn sub_unify(&mut self,
+                 environment: &Arc<Environment>,
+                 ty1: Ty,
+                 ty2: Ty)
+                 -> Result<()> {
+        let eq_goal = EqGoal { a: ParameterKind::Ty(ty1), b: ParameterKind::Ty(ty2) };
+        let goal = InEnvironment::new(environment, eq_goal);
+
+        debug!("subunify: goal = {:?}", goal);
+        self.goals.push(goal.cast());
+
+        Ok(())
     }
 
     fn unify_ty_ty<'a>(&mut self, a: &'a Ty, b: &'a Ty) -> Result<()> {
@@ -176,13 +193,7 @@ impl<'t> Unifier<'t> {
         debug!("unify_forall_tys: ty1 = {:?}", ty1);
         debug!("unify_forall_tys: ty2 = {:?}", ty2);
 
-        let eq_goal = EqGoal { a: ParameterKind::Ty(ty1), b: ParameterKind::Ty(ty2) };
-        let goal = InEnvironment::new(&environment, eq_goal).cast();
-        debug!("unify_forall_tys: goal = {:?}", goal);
-
-        self.goals.push(goal);
-
-        Ok(())
+        self.sub_unify(&environment, ty1, ty2)
     }
 
     fn unify_projection_tys(&mut self, proj1: &ProjectionTy, proj2: &ProjectionTy) -> Result<()> {
@@ -213,10 +224,7 @@ impl<'t> Unifier<'t> {
         let ty1 = ty1.subst(&lifetimes1);
         let ty2 = ty2.clone();
 
-        let eq_goal = EqGoal { a: ParameterKind::Ty(ty1), b: ParameterKind::Ty(ty2) };
-        self.goals.push(InEnvironment::new(&environment, eq_goal).cast());
-
-        Ok(())
+        self.sub_unify(&environment, ty1, ty2)
     }
 
     fn unify_var_ty(&mut self, var: TyInferenceVariable, ty: &Ty) -> Result<()> {
