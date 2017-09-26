@@ -1,7 +1,8 @@
+#![allow(unused_doc_comment)]
+
 use chalk_parse::{self, ast};
 use ir;
 
-#[allow(unused_doc_comment)]
 error_chain! {
     links {
         Parse(chalk_parse::errors::Error, chalk_parse::errors::ErrorKind);
