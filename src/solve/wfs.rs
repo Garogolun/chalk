@@ -111,9 +111,6 @@ struct Table {
     /// The canonical goal that started us on this mess.
     canonical_goal: CanonicalGoal,
 
-    /// Inference table for all stack entries related to this goal.
-    infer: InferenceTable,
-
     /// Stores the answers that we have found thus far. These are
     /// expressed as canonical substitutions for the inference
     /// variables found in our initial goal.
@@ -148,6 +145,24 @@ struct SimplifiedGoals {
     negative: Vec<InEnvironment<Goal>>,
 }
 
+/// The paper describes these as `A :- D | G`.
+struct ExClause {
+    /// The goal of the table `A`.
+    table_goal: DomainGoal,
+
+    /// Delayed literals: things that we depend on negatively,
+    /// but which have not yet been fully evaluated.
+    delayed_literals: Vec<Goal>,
+
+    /// Literals: domain goals that must be proven to be true.
+    literals: Vec<DomainGoal>,
+
+    /// Goals: HH goals that must be proven to be true. These are
+    /// basically just literals that have not yet been simplified into
+    /// domain goals.
+    subgoals: Vec<Goal>,
+}
+
 struct WaitingGoal {
     table_index: TableIndex,
     stack_index: StackIndex,
@@ -160,6 +175,7 @@ struct Minimums {
 
 type CanonicalGoal = Canonical<InEnvironment<Goal>>;
 type CanonicalSubst = Canonical<ConstrainedSubst>>;
+type CanonicalExClause = Canonical<InEnvironment<ExClause>>;
 
 impl WfsSolver {
     pub fn new(program: &Arc<ProgramEnvironment>, goal: Goal) {
@@ -235,7 +251,7 @@ impl WfsSolver {
                         table_index: TableIndex,
                         initial_environment: &Arc<Environment>,
                         initial_goal: Goal)
-                        -> Result<Vec<SimplifiedGoals>>
+                        -> Result<SimplifiedGoals>
     {
         // A stack of higher-level goals to process.
         let mut goals = vec![(initial_environment.clone(), initial_goal)];
@@ -349,11 +365,9 @@ impl WfsSolver {
     }
 
     fn slg_resolvent(&mut self,
-                     table_index: TableIndex,
-                     environment: &Arc<Environment>,
-                     goal: DomainGoal,
+                     goal: &CanonicalExClause,
                      clause: &Binders<ProgramClauseImplication>)
-                     -> Result<Vec<InEnvironment<Goal>>>
+                     -> Result<CanonicalExClause>
     {
         // From EWFS:
         //
@@ -376,17 +390,29 @@ impl WfsSolver {
 
         // Relating the above description to our situation:
         //
-        // - `goal` is the selected literal Li.
+        // - `goal` G, except with binders for any existential variables.
+        //   - Also, we always select the first literal in `ex_clause.literals`, so `i` is 0.
         // - `clause` is C, except with binders for any existential variables.
 
-        let table = &mut self.tables[table_index];
+        let mut infer = InferenceTable::new();
 
-        // Clause here is now C' in the description above.
-        let clause = table.instantiate_binders(&clause);
+        // Goal here is now G.
+        let InEnvironment { environment, goal } = infer.instantiate(&goal.binders, &goal.value);
 
-        // We have now unified Li and C'; unlike in the description above, this yields
-        // some extra "conditions" that we can lump in with L1'..Lm', effectively.
-        let mut subgoals = table.unify(environment, &goal, clause.consequence)?;
+        // Clause here is now C' in the description above. Note that G
+        // and C' have no variables in common.
+        let clause = infer.instantiate_in(environment.universe, &clause.binders, &clause.value);
+
+        // The selected literal for us will always be Ln. See if we
+        // can unify that with C'.
+        assert!(goal.literals.len() > 0, "goal has no selected literals");
+        let selected_literal = goal.literals.pop();
+        let UnificationResult { goals, constraints, cannot_prove } =
+            infer.unify(environment, &goal.literals[0], clause.implication)?;
+        assert!(constraints.is_empty(), "Not yet implemented: region constraints");
+        assert!(!cannot_prove, "Not yet implemented: cannot_prove");
+
+        goal.literals.
         subgoals.extend(clause.conditions.into_iter().map(|g| InEnvironment::new(environment, g)));
 
         // Return the union of L1'...Lm' with those extra conditions. We are assuming
