@@ -34,14 +34,14 @@ impl InferenceTable {
 struct Unifier<'t> {
     table: &'t mut InferenceTable,
     environment: &'t Arc<Environment>,
-    goals: Vec<InEnvironment<LeafGoal>>,
+    goals: Vec<InEnvironment<DomainGoal>>,
     constraints: Vec<InEnvironment<Constraint>>,
     cannot_prove: bool,
 }
 
 #[derive(Debug)]
 pub struct UnificationResult {
-    pub goals: Vec<InEnvironment<LeafGoal>>,
+    pub goals: Vec<InEnvironment<DomainGoal>>,
     pub constraints: Vec<InEnvironment<Constraint>>,
 
     /// When unifying two skolemized (forall-quantified) type names, we can

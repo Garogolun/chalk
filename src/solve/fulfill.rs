@@ -1,4 +1,5 @@
 use super::*;
+use cast::Caster;
 use errors::*;
 use fold::Fold;
 use solve::infer::{InferenceTable, UnificationResult, ParameterInferenceVariable};
@@ -123,7 +124,7 @@ impl<'s> Fulfill<'s> {
         debug!("unify: constraints={:?}", constraints);
         debug!("unify: cannot_prove={:?}", cannot_prove);
         self.constraints.extend(constraints);
-        self.obligations.extend(goals.into_iter().map(Obligation::Prove));
+        self.obligations.extend(goals.into_iter().casted().map(Obligation::Prove));
         self.cannot_prove = self.cannot_prove || cannot_prove;
         Ok(())
     }
