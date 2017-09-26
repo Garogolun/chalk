@@ -15,6 +15,7 @@ use chalk::solve::solver::{self, Solver, CycleStrategy};
 
 use rustyline::error::ReadlineError;
 
+#[allow(unused_doc_comment)]
 error_chain! {
     links {
         Parse(chalk_parse::errors::Error, chalk_parse::errors::ErrorKind);

@@ -83,12 +83,11 @@ impl<'t> Unifier<'t> {
                  ty1: Ty,
                  ty2: Ty)
                  -> Result<()> {
-        let eq_goal = EqGoal { a: ParameterKind::Ty(ty1), b: ParameterKind::Ty(ty2) };
-        let goal = InEnvironment::new(environment, eq_goal);
-
-        debug!("subunify: goal = {:?}", goal);
-        self.goals.push(goal.cast());
-
+        let sub_unifier = Unifier::new(self.table, environment);
+        let UnificationResult { goals, constraints, cannot_prove } = sub_unifier.unify(&ty1, &ty2)?;
+        self.goals.extend(goals);
+        self.constraints.extend(constraints);
+        self.cannot_prove |= cannot_prove;
         Ok(())
     }
 
