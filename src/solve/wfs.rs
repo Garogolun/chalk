@@ -120,7 +120,7 @@ struct Table {
     /// Stack entries waiting to hear about POSITIVE results from this
     /// table. This occurs when you have something like `foo(X) :-
     /// bar(X)`.
-    positives: Vec<CanonicalExClause>,
+    positives: Vec<CanonicalPendingExClause>,
 
     /// Stack entries waiting to hear about NEGATIVE results from this
     /// table. This occurs when you have something like `foo(X) :- not
@@ -133,15 +133,22 @@ struct Table {
     completely_evaluated: bool,
 }
 
+struct PendingExClause {
+    table_goal: InEnvironment<DomainGoal>,
+    selected_literal: InEnvironment<DomainGoal>,
+    delayed_literals: Vec<InEnvironment<Goal>>,
+    subgoals: Vec<InEnvironment<Goal>>,
+}
+
 /// The paper describes these as `A :- D | G`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ExClause {
     /// The goal of the table `A`.
-    table_goal: InEnvironment<Goal>,
+    table_goal: InEnvironment<DomainGoal>,
 
     /// Delayed literals: things that we depend on negatively,
     /// but which have not yet been fully evaluated.
-    delayed_literals: Vec<InEnvironment<Goal>>,
+    delayed_literals: Vec<InEnvironment<DomainGoal>>,
 
     /// Literals: domain goals that must be proven to be true.
     subgoals: Vec<InEnvironment<Goal>>,
@@ -151,8 +158,8 @@ struct ExClause {
 /// this is it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ExClauseAnswer {
-    table_goal: Goal,
-    delayed_literals: Vec<InEnvironment<Goal>>,
+    table_goal: DomainGoal,
+    delayed_literals: Vec<InEnvironment<DomainGoal>>,
 }
 
 struct WaitingGoal {
@@ -163,6 +170,11 @@ struct WaitingGoal {
 struct Minimums {
     positive: usize,
     negative: usize,
+}
+
+struct SimplifiedGoals {
+    positive: Vec<InEnvironment<DomainGoal>>,
+    negative: Vec<InEnvironment<DomainGoal>>,
 }
 
 type CanonicalGoal = Canonical<InEnvironment<Goal>>;
@@ -206,24 +218,13 @@ impl Forest {
     //    forest.subgoal(&canonical_goal, &mut minimums)
     //}
 
-    /// This is the HH-extension of SLG_SUBGOAL from EWFS. We have
-    /// expanded it slightly to account for the fact that we have
-    /// richer sets of goals in HH predicates.
+    /// This is SLG_SUBGOAL from EWFS.
     fn subgoal(&mut self,
                table: TableIndex,
-               canonical_goal: &CanonicalGoal,
+               canonical_goal: &CanonicalDomainGoal,
                minimums: &mut Minimums)
                -> Result<()>
     {
-        // We are tweaking the paper definition just a bit. In the
-        // paper, the first step is to find the SLG resolvent of `A :-
-        // A` with some clause. In this implementation, we first
-        // "lower" the HH goal to a domain goal, and hence we have
-        // something like `A :- L0...Ln`, where `L0...Ln` are domain
-        // goals (literals). Then we find the resolvent with the first
-        // of *those*.  In the case where the HH goal *is* a domain
-        // goal, this should be identical.
-        let ex_clause = self.simplify_hh_goal(canonical_goal)?;
         let clauses = self.clauses(canonical_goal);
 
         for clause in clauses {
@@ -233,86 +234,6 @@ impl Forest {
         }
 
         self.complete(table, minimums);
-    }
-
-    /// Simplifies an HH goal into a series of positive domain goals
-    /// and negative HH goals. This operation may fail if the HH goal
-    /// includes unifications that cannot be completed.
-    fn simplify_hh_goal(&mut self, goal: &CanonicalGoal) -> Result<CanonicalExClause> {
-        let mut infer = InferenceTable::new();
-
-        let initial_env_goal = infer.instantiate(&goal.binders, &goal.value);
-
-        // The final result we will accumulate into.
-        let mut ex_clause = ExClause {
-            table_goal: initial_env_goal.clone(),
-
-            delayed_literals: vec![],
-
-            subgoals: vec![]
-        };
-
-        // A stack of higher-level goals to process.
-        let mut pending_goals = vec![initial_env_goal];
-
-        while let Some(InEnvironment { environment, value: goal }) = pending_goals.pop() {
-            match goal {
-                Goal::Quantified(QuantifierKind::ForAll, subgoal) => {
-                    let mut new_environment = environment;
-                    let parameters: Vec<_> =
-                        subgoal.binders
-                               .iter()
-                               .map(|pk| {
-                                   new_environment = new_environment.new_universe();
-                                   match *pk {
-                                       ParameterKind::Lifetime(()) => {
-                                           let lt = Lifetime::ForAll(new_environment.universe);
-                                           ParameterKind::Lifetime(lt)
-                                       }
-                                       ParameterKind::Ty(()) =>
-                                           ParameterKind::Ty(Ty::Apply(ApplicationTy {
-                                               name: TypeName::ForAll(new_environment.universe),
-                                               parameters: vec![]
-                                           })),
-                                   }
-                               })
-                               .collect();
-                    let subgoal = subgoal.value.subst(&parameters);
-                    pending_goals.push(InEnvironment::new(&new_environment, subgoal));
-                }
-                Goal::Quantified(QuantifierKind::Exists, subgoal) => {
-                    let subgoal = self.instantiate_in(environment.universe,
-                                                      subgoal.binders.iter().cloned(),
-                                                      &subgoal.value);
-                    pending_goals.push(InEnvironment::new(&environment, *subgoal))
-                }
-                Goal::Implies(wc, subgoal) => {
-                    let new_environment = &environment.add_clauses(wc);
-                    pending_goals.push(InEnvironment::new(&new_environment, *subgoal));
-                }
-                Goal::And(subgoal1, subgoal2) => {
-                    pending_goals.push(InEnvironment::new(&environment, *subgoal1));
-                    pending_goals.push(InEnvironment::new(&environment, *subgoal2));
-                }
-                Goal::Not(subgoal) => {
-                    panic!("not yet implemented -- negative goals")
-                }
-                Goal::Leaf(LeafGoal::EqGoal(eq_goal)) => {
-                    let UnificationResult { goals, constraints, cannot_prove } =
-                        infer.unify(environment, &eq_goal.a, &eq_goal.b)?;
-
-                    assert!(constraints.is_empty(), "Not yet implemented: region constraints");
-                    assert!(!cannot_prove, "Not yet implemented: cannot_prove");
-
-                    pending_goals.extend(goals);
-                }
-                Goal::Leaf(LeafGoal::DomainGoal(domain_goal)) => {
-                    ex_clause.subgoals.push(InEnvironment::new(&environment, domain_goal));
-                }
-            }
-        }
-
-        infer.canonicalize(&ex_clause)
     }
 
     fn unify(&mut self,
@@ -370,51 +291,143 @@ impl Forest {
         let mut ex_clause = infer.instantiate(&ex_clause.binders, &ex_clause.value);
 
         let selected_subgoal = ex_clause.subgoals.pop().unwrap();
-        let canonical_subgoal = infer.canonicalize(&selected_subgoal);
-        let index = match self.tables.index(&canonical_subgoal) {
-            Some(i) => i,
-            None => {
-                // No table for `canonical_subgoal` yet.
-                // ...
-                // let minimums = &mut Minimums::new();
-                // self.subgoal(new_table_index, &canonical_subgoal, minimums);
-                // ...
-                unimplemented!();
-                return;
-            }
-        };
 
-        // Register ourselves to receive any new answers.
-        let mut new_clauses = {
-            let table = &mut self.tables[index];
-            table.positives.push(ex_clause.clone());
-            table.answers
-                 .iter()
-                 .flat_map(|answer| {
-                     Self::incorporate_cached_answer(&mut infer,
-                                                     &ex_clause,
-                                                     &selected_subgoal,
-                                                     answer)
-                 })
-                 .collect()
-        };
+        // In the paper, `selected_subgoal` is also a literal. But for
+        // us, that is not true, because we are dealing in HH
+        // goals. So we have to simplify down into literals (possibly
+        // in distinct environments).
+        let simplified_goals = Self::simplify_hh_goal(&mut infer, &selected_subgoal);
+
+        assert!(simplified_goals.negative.is_empty(), "not dealing with negative yet");
+
+        // All of the positive literals must be true.
+        for selected_literal in simplified_goals.positive {
+            let canonical_literal = infer.canonicalize(&selected_literal);
+            let index = match self.tables.index_of(&canonical_literal) {
+                Some(i) => i,
+                None => {
+                    // No table for `canonical_literal` yet.
+                    // ...
+                    // let minimums = &mut Minimums::new();
+                    // self.subgoal(new_table_index, &canonical_subgoal, minimums);
+                    // ...
+                    unimplemented!();
+                    return;
+                }
+            };
+
+            // Register ourselves to receive any new answers.
+            let mut new_clauses = {
+                let table = &mut self.tables[index];
+                table.positives.push(infer.canonicalize(&PendingExClause {
+                    table_goal: ex_clause.table_goal.clone(),
+                    selected_literal: selected_literal.clone(),
+                    delayed_literals: ex_clause.delayed_literals.clone(),
+                    subgoals: ex_clause.subgoals.clone(),
+                }));
+                table.answers
+                     .iter()
+                     .flat_map(|answer| {
+                         Self::incorporate_cached_answer(&mut infer,
+                                                         &ex_clause,
+                                                         &selected_literal,
+                                                         answer)
+                     })
+                     .collect()
+            };
+        }
 
         unimplemented!()
     }
 
+    /// Simplifies an HH goal into a series of positive domain goals
+    /// and negative HH goals. This operation may fail if the HH goal
+    /// includes unifications that cannot be completed.
+    fn simplify_hh_goal(infer: &mut InferenceTable,
+                        initial_env_goal: &InEnvironment<Goal>)
+                        -> Result<SimplifiedGoals> {
+        // The final result we will accumulate into.
+        let mut simplified_goals = SimplifiedGoals {
+            negative: vec![],
+            positive: vec![]
+        };
+
+        // A stack of higher-level goals to process.
+        let mut pending_goals = vec![initial_env_goal];
+
+        while let Some(InEnvironment { environment, value: goal }) = pending_goals.pop() {
+            match goal {
+                Goal::Quantified(QuantifierKind::ForAll, subgoal) => {
+                    let mut new_environment = environment;
+                    let parameters: Vec<_> =
+                        subgoal.binders
+                               .iter()
+                               .map(|pk| {
+                                   new_environment = new_environment.new_universe();
+                                   match *pk {
+                                       ParameterKind::Lifetime(()) => {
+                                           let lt = Lifetime::ForAll(new_environment.universe);
+                                           ParameterKind::Lifetime(lt)
+                                       }
+                                       ParameterKind::Ty(()) =>
+                                           ParameterKind::Ty(Ty::Apply(ApplicationTy {
+                                               name: TypeName::ForAll(new_environment.universe),
+                                               parameters: vec![]
+                                           })),
+                                   }
+                               })
+                               .collect();
+                    let subgoal = subgoal.value.subst(&parameters);
+                    pending_goals.push(InEnvironment::new(&new_environment, subgoal));
+                }
+                Goal::Quantified(QuantifierKind::Exists, subgoal) => {
+                    let subgoal = self.instantiate_in(environment.universe,
+                                                      subgoal.binders.iter().cloned(),
+                                                      &subgoal.value);
+                    pending_goals.push(InEnvironment::new(&environment, *subgoal))
+                }
+                Goal::Implies(wc, subgoal) => {
+                    let new_environment = &environment.add_clauses(wc);
+                    pending_goals.push(InEnvironment::new(&new_environment, *subgoal));
+                }
+                Goal::And(subgoal1, subgoal2) => {
+                    pending_goals.push(InEnvironment::new(&environment, *subgoal1));
+                    pending_goals.push(InEnvironment::new(&environment, *subgoal2));
+                }
+                Goal::Not(subgoal) => {
+                    panic!("not yet implemented -- negative goals")
+                }
+                Goal::Leaf(LeafGoal::EqGoal(eq_goal)) => {
+                    let UnificationResult { goals, constraints, cannot_prove } =
+                        infer.unify(environment, &eq_goal.a, &eq_goal.b)?;
+
+                    assert!(constraints.is_empty(), "Not yet implemented: region constraints");
+                    assert!(!cannot_prove, "Not yet implemented: cannot_prove");
+
+                    pending_goals.extend(goals);
+                }
+                Goal::Leaf(LeafGoal::DomainGoal(domain_goal)) => {
+                    simplified_goals.push(InEnvironment::new(&environment, domain_goal));
+                }
+            }
+        }
+
+        simplified_goals
+    }
+
     fn incorporate_cached_answer(infer: &mut InferenceTable,
                                  ex_clause: &ExClause,
-                                 selected_literal: &InEnvironment<Goal>,
-                                 answer: &CanonicalExClause)
+                                 selected_literal: &InEnvironment<DomainGoal>,
+                                 answer: &CanonicalExClauseAnswer)
                                  -> Result<CanonicalExClause>
     {
-        assert!(answer.subgoals.is_empty(), "answer with pending subgoals??");
-
         if answer.delayed_literals.is_empty() {
             Self::slg_resolvent_answer(infer,
                                        ex_clause,
                                        selected_literal,
                                        answer)
+        } else {
+            unimplemented!("delayed literals")
         }
     }
 
@@ -460,7 +473,7 @@ impl Forest {
     /// - `answer` is some answer to `selected_literal` that has been found
     fn slg_resolvent_answer(infer: &mut InferenceTable,
                             ex_clause: &ExClause,
-                            selected_literal: &InEnvironment<Goal>,
+                            selected_literal: &InEnvironment<DomainGoal>,
                             answer: &CanonicalExClauseAnswer)
                             -> Result<CanonicalExClause>
     {
@@ -545,8 +558,8 @@ impl Forest {
     fn slg_resolvent_unify(infer: &mut InferenceTable,
                            environment: &Arc<Environment>,
                            goal: ExClause,
-                           selected_literal: &Goal,
-                           consequence: &Goal,
+                           selected_literal: &DomainGoal,
+                           consequence: &DomainGoal,
                            conditions: Vec<Goal>)
                            -> Result<CanonicalExClause>
     {
@@ -583,7 +596,7 @@ impl IndexMut<TableIndex> for Tables {
 }
 
 impl Tables {
-    fn index(&self, subgoal: &CanonicalGoal) -> Option<TableIndex> {
-        self.table_indices.get(subgoal)
+    fn index_of(&self, literal: &CanonicalDomainGoal) -> Option<TableIndex> {
+        self.table_indices.get(literal)
     }
 }
