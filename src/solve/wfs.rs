@@ -25,13 +25,16 @@
 //! - HH: Hereditary harrop predicates. What Chalk deals in.
 //!   Popularized by Lambda Prolog.
 
+use errors::*;
 use ir::*;
+use solve::infer::{InferenceTable, UnificationResult};
 use std::collections::{HashMap, HashSet};
 use std::ops::{Index, IndexMut};
+use std::sync::Arc;
 use std::usize;
 
-pub struct WfsSolver {
-    program: Arc<ProgramEnvironment>,
+pub fn solve(program: &Arc<ProgramEnvironment>, goal: Goal) {
+    // Forest::solve(program, goal)
 }
 
 /// The **FOREST** of evaluation tracks all the in-progress work.
@@ -68,6 +71,7 @@ pub struct WfsSolver {
 ///     related. (Indeed, coping with this is actually the source of
 ///     some complexity in the machine itself.)
 struct Forest {
+    program: Arc<ProgramEnvironment>,
     tables: Tables,
     stack: Stack,
 }
@@ -108,23 +112,20 @@ struct StackEntry {
 }
 
 struct Table {
-    /// The canonical goal that started us on this mess.
-    canonical_goal: CanonicalGoal,
-
     /// Stores the answers that we have found thus far. These are
     /// expressed as canonical substitutions for the inference
     /// variables found in our initial goal.
-    answers: HashSet<CanonicalSubst>,
+    answers: HashSet<CanonicalExClauseAnswer>,
 
     /// Stack entries waiting to hear about POSITIVE results from this
     /// table. This occurs when you have something like `foo(X) :-
     /// bar(X)`.
-    positives: Vec<WaitingGoal>,
+    positives: Vec<CanonicalExClause>,
 
     /// Stack entries waiting to hear about NEGATIVE results from this
     /// table. This occurs when you have something like `foo(X) :- not
     /// bar(X)`.
-    negatives: Vec<WaitingGoal>,
+    negatives: Vec<CanonicalExClause>,
 
     /// True if this table has been COMPLETELY EVALUATED, meaning that
     /// we have found all the answers that there are to find (and put
@@ -133,6 +134,7 @@ struct Table {
 }
 
 /// The paper describes these as `A :- D | G`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ExClause {
     /// The goal of the table `A`.
     table_goal: InEnvironment<Goal>,
@@ -142,7 +144,15 @@ struct ExClause {
     delayed_literals: Vec<InEnvironment<Goal>>,
 
     /// Literals: domain goals that must be proven to be true.
-    subgoals: Vec<InEnvironment<DomainGoal>>,
+    subgoals: Vec<InEnvironment<Goal>>,
+}
+
+/// When we actually find an answer to an X-clause,
+/// this is it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ExClauseAnswer {
+    table_goal: Goal,
+    delayed_literals: Vec<InEnvironment<Goal>>,
 }
 
 struct WaitingGoal {
@@ -157,43 +167,44 @@ struct Minimums {
 
 type CanonicalGoal = Canonical<InEnvironment<Goal>>;
 type CanonicalDomainGoal = Canonical<InEnvironment<DomainGoal>>;
-type CanonicalSubst = Canonical<ConstrainedSubst>>;
+type CanonicalSubst = Canonical<ConstrainedSubst>;
 type CanonicalExClause = Canonical<ExClause>;
+type CanonicalExClauseAnswer = Canonical<ExClauseAnswer>;
 
-impl WfsSolver {
-    pub fn new(program: &Arc<ProgramEnvironment>, goal: Goal) {
-        let program = program.clone();
-
-        // Initial program has no free variables, so it is canonical
-        // by definition, and it starts from an empty environment.
-        let canonical_goal = Canonical {
-            value: InEnvironment::empty(goal),
-            binders: vec![],
-        };
-
-        let mut table = HashMap::new();
-        table.insert(
-            canonical_goal.clone(),
-            TableEntry {
-                answers: HashSet::new(),
-                positives: vec![],
-                negatives: vec![],
-                completely_evaluated: false,
-            });
-
-        let stack = vec![
-            StackEntry {
-                goal: canonical_goal,
-                pos_link: 0,
-                neg_link: usize::MAX,
-            }
-        ];
-
-        let mut wfs = WfsSolver { program, table, stack };
-
-        let mut minimums = Minimums { positive: 1, negative: usize::MAX };
-        wfs.subgoal_hh(&canonical_goal, &mut minimums)
-    }
+impl Forest {
+    //pub fn solve(program: &Arc<ProgramEnvironment>, goal: Goal) {
+    //    let program = program.clone();
+    //
+    //    // Initial program has no free variables, so it is canonical
+    //    // by definition, and it starts from an empty environment.
+    //    let canonical_goal = Canonical {
+    //        value: InEnvironment::empty(goal),
+    //        binders: vec![],
+    //    };
+    //
+    //    let mut table = HashMap::new();
+    //    table.insert(
+    //        canonical_goal.clone(),
+    //        Table {
+    //            answers: HashSet::new(),
+    //            positives: vec![],
+    //            negatives: vec![],
+    //            completely_evaluated: false,
+    //        });
+    //
+    //    let stack = vec![
+    //        //StackEntry {
+    //        //    goal: canonical_goal,
+    //        //    pos_link: 0,
+    //        //    neg_link: usize::MAX,
+    //        //}
+    //    ];
+    //
+    //    let mut forest = Forest { program, table, stack };
+    //
+    //    let mut minimums = Minimums { positive: 1, negative: usize::MAX };
+    //    forest.subgoal(&canonical_goal, &mut minimums)
+    //}
 
     /// This is the HH-extension of SLG_SUBGOAL from EWFS. We have
     /// expanded it slightly to account for the fact that we have
@@ -201,7 +212,9 @@ impl WfsSolver {
     fn subgoal(&mut self,
                table: TableIndex,
                canonical_goal: &CanonicalGoal,
-               minimums: &mut Minimums) {
+               minimums: &mut Minimums)
+               -> Result<()>
+    {
         // We are tweaking the paper definition just a bit. In the
         // paper, the first step is to find the SLG resolvent of `A :-
         // A` with some clause. In this implementation, we first
@@ -210,11 +223,11 @@ impl WfsSolver {
         // goals (literals). Then we find the resolvent with the first
         // of *those*.  In the case where the HH goal *is* a domain
         // goal, this should be identical.
-        let ex_clause = self.hh_goal_to_ex_clause(canonical_goal);
+        let ex_clause = self.simplify_hh_goal(canonical_goal)?;
         let clauses = self.clauses(canonical_goal);
 
-        for clause in &clauses {
-            if let Ok(slg_resolvent) = self.slg_resolvent(&ex_clause, clause) {
+        for clause in clauses {
+            if let Ok(slg_resolvent) = Self::slg_resolvent_clause(&ex_clause, clause) {
                 self.new_clause(table, slg_resolvent, minimums)?;
             }
         }
@@ -358,41 +371,143 @@ impl WfsSolver {
 
         let selected_subgoal = ex_clause.subgoals.pop().unwrap();
         let canonical_subgoal = infer.canonicalize(&selected_subgoal);
-        if /* canonical subgoal is not in table T */ {
-            // ...
-            let minimums = &mut Minimums::new();
-            self.subgoal(new_table_index, &canonical_subgoal, minimums);
-            // ...
-            return;
-        }
+        let index = match self.tables.index(&canonical_subgoal) {
+            Some(i) => i,
+            None => {
+                // No table for `canonical_subgoal` yet.
+                // ...
+                // let minimums = &mut Minimums::new();
+                // self.subgoal(new_table_index, &canonical_subgoal, minimums);
+                // ...
+                unimplemented!();
+                return;
+            }
+        };
 
-        // Canonical subgoal IS in the table T.
+        // Register ourselves to receive any new answers.
+        let mut new_clauses = {
+            let table = &mut self.tables[index];
+            table.positives.push(ex_clause.clone());
+            table.answers
+                 .iter()
+                 .flat_map(|answer| {
+                     Self::incorporate_cached_answer(&mut infer,
+                                                     &ex_clause,
+                                                     &selected_subgoal,
+                                                     answer)
+                 })
+                 .collect()
+        };
+
+        unimplemented!()
     }
 
-    fn slg_resolvent(&mut self,
-                     goal: &CanonicalExClause,
-                     clause: &Binders<ProgramClauseImplication>)
-                     -> Result<CanonicalExClause>
+    fn incorporate_cached_answer(infer: &mut InferenceTable,
+                                 ex_clause: &ExClause,
+                                 selected_literal: &InEnvironment<Goal>,
+                                 answer: &CanonicalExClause)
+                                 -> Result<CanonicalExClause>
     {
-        // From EWFS:
-        //
-        // Let G be an X-clause A :- D | L1,...Ln, where N > 0, and Li be selected atom.
-        //
-        // Let C be an X-clause with no delayed literals. Let
-        //
-        //     C' = A' :- L'1...L'n
-        //
-        // be a variant of C such that G and C' have no variables in
-        // common.
-        //
-        // Let Li and A' be unified with MGU S.
-        //
-        // Then:
-        //
-        //     S(A :- D | L1...Li-1, L1'...Lm', Li+1...Ln)
-        //
-        // is the SLG resolvent of G with C.
+        assert!(answer.subgoals.is_empty(), "answer with pending subgoals??");
 
+        if answer.delayed_literals.is_empty() {
+            Self::slg_resolvent_answer(infer,
+                                       ex_clause,
+                                       selected_literal,
+                                       answer)
+        }
+    }
+
+    ///////////////////////////////////////////////////////////////////////////
+    // SLG RESOLVENTS
+    //
+    // The "SLG Resolvent" is used to combine a *goal* G with some
+    // clause or answer *C*.  It unifies the goal's selected literal
+    // with the clause and then inserts the clause's conditions into
+    // the goal's list of things to prove, basically. Although this is
+    // one operation in EWFS, we have specialized variants for merging
+    // a program clause and an answer (though they share some code in
+    // common).
+    //
+    // From EWFS:
+    //
+    // Let G be an X-clause A :- D | L1,...Ln, where N > 0, and Li be selected atom.
+    //
+    // Let C be an X-clause with no delayed literals. Let
+    //
+    //     C' = A' :- L'1...L'n
+    //
+    // be a variant of C such that G and C' have no variables in
+    // common.
+    //
+    // Let Li and A' be unified with MGU S.
+    //
+    // Then:
+    //
+    //     S(A :- D | L1...Li-1, L1'...Lm', Li+1...Ln)
+    //
+    // is the SLG resolvent of G with C.
+
+    /// Applies the SLG resolvent algorithm to incorporate an answer
+    /// produced by the selected literal into the main X-clause,
+    /// producing a new X-clause that must be solved.
+    ///
+    /// # Parameters
+    ///
+    /// - `ex_clause` is the X-clause we are trying to prove,
+    ///   with the selected literal removed from its list of subgoals
+    /// - `selected_literal` is the selected literal that was removed
+    /// - `answer` is some answer to `selected_literal` that has been found
+    fn slg_resolvent_answer(infer: &mut InferenceTable,
+                            ex_clause: &ExClause,
+                            selected_literal: &InEnvironment<Goal>,
+                            answer: &CanonicalExClauseAnswer)
+                            -> Result<CanonicalExClause>
+    {
+        // Relating the above describes to our parameters:
+        //
+        // - the goal G is `ex_clause` is, with `selected_literal` being
+        //   the selected literal Li, already removed from the list.
+        // - the clause C is `answer.` (i.e., the answer has no conditions).
+
+        let snapshot = infer.snapshot();
+
+        let result = do catch {
+            // C' is now `answer`. No variables in commmon with G.
+            let answer = infer.instantiate(&answer.binders, &answer.value);
+
+            assert!(answer.delayed_literals.is_empty(),
+                    "slg resolvent invoked with delayed literals");
+
+            let InEnvironment { ref environment, value: ref selected_literal } =
+                *selected_literal;
+
+            // Perform the SLG resolvent unification.
+            Self::slg_resolvent_unify(infer,
+                                      environment,
+                                      ex_clause.clone(),
+                                      selected_literal,
+                                      &answer.table_goal,
+                                      vec![])?;
+        };
+
+        infer.rollback_to(snapshot);
+
+        result
+    }
+
+    /// Applies the SLG resolvent algorithm to incorporate a program
+    /// clause into the main X-clause, producing a new X-clause that
+    /// must be solved.
+    ///
+    /// # Parameters
+    ///
+    /// - `goal` is the goal G that we are trying to solve
+    /// - `clause` is the program clause that may be useful to that end
+    fn slg_resolvent_clause(goal: &CanonicalExClause,
+                            clause: &Binders<ProgramClauseImplication>)
+                            -> Result<CanonicalExClause>
+    {
         // Relating the above description to our situation:
         //
         // - `goal` G, except with binders for any existential variables.
@@ -409,18 +524,43 @@ impl WfsSolver {
         assert!(goal.subgoals.len() > 0, "goal has no selected literals");
         let InEnvironment { environment, value: selected_literal } = goal.subgoals.pop();
 
-        // Clause here is now C' in the description above. Note that G
-        // and C' have no variables in common.
-        let clause = infer.instantiate_in(environment.universe, &clause.binders, &clause.value);
+        // C' in the description above is `consequence :- conditions`.
+        //
+        // Note that G and C' have no variables in common.
+        let ProgramClauseImplication { consequence, conditions } =
+            infer.instantiate_in(environment.universe, &clause.binders, &clause.value);
 
+        Self::slg_resolvent_unify(&mut infer,
+                                  &environment,
+                                  goal,
+                                  selected_literal,
+                                  consequence,
+                                  conditions)
+    }
+
+    /// Given the goal G (`goal`) with selected literal Li
+    /// (`selected_literal`), the goal environment `environment`, and
+    /// the clause C' (`consequence :- conditions`), applies the SLG
+    /// resolvent algorithm to yield a new `ExClause`.
+    fn slg_resolvent_unify(infer: &mut InferenceTable,
+                           environment: &Arc<Environment>,
+                           goal: ExClause,
+                           selected_literal: &Goal,
+                           consequence: &Goal,
+                           conditions: Vec<Goal>)
+                           -> Result<CanonicalExClause>
+    {
         // Unify the selected literal Li with C'.
         let UnificationResult { goals, constraints, cannot_prove } =
-            infer.unify(environment, &selected_literal, clause.implication)?;
+            infer.unify(environment, &selected_literal, &consequence)?;
+
+        // Add the `conditions` into the result.
+        goal.subgoals.extend(conditions);
 
         // One (minor) complication: unification for us sometimes yields further domain goals.
         assert!(constraints.is_empty(), "Not yet implemented: region constraints");
         assert!(!cannot_prove, "Not yet implemented: cannot_prove");
-        goal.subgoals.extend(goals);
+        goal.subgoals.extend(goals.into_iter().casted());
 
         // Return the union of L1'...Lm' with those extra conditions. We are assuming
         // in this routine that the selected literal Li was the only literal.
@@ -442,24 +582,8 @@ impl IndexMut<TableIndex> for Tables {
     }
 }
 
-impl Table {
-    /// Unify `a` and `b`. If this succeeds, it returns a series of
-    /// sub-goals that must then be processed as a result.
-    fn unify<T>(&mut self,
-                environment: &Arc<Environment>,
-                a: &T,
-                b: &T)
-                -> Result<Vec<(Arc<Environment>, Goal)>>
-        where T: ?Sized + Zip + Debug
-    {
-        let table = &mut self.tables[table_index];
-    }
-
-    /// Instantiate `value`, replacing all the bound variables with
-    /// free inference variables.
-    fn instantiate_binders<T>(&mut self, value: &Binders<T>) -> T::Result
-        where T: Fold
-    {
-        self.infer.instantiate(&value.binders, &value.value)
+impl Tables {
+    fn index(&self, subgoal: &CanonicalGoal) -> Option<TableIndex> {
+        self.table_indices.get(subgoal)
     }
 }

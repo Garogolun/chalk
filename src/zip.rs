@@ -1,5 +1,6 @@
 use errors::*;
 use ir::*;
+use std::fmt::Debug;
 use std::sync::Arc;
 
 pub trait Zipper {
@@ -17,7 +18,7 @@ impl<'f, Z: Zipper> Zipper for &'f mut Z {
     }
 }
 
-pub trait Zip {
+pub trait Zip: Debug {
     fn zip_with<Z: Zipper>(zipper: &mut Z, a: &Self, b: &Self) -> Result<()>;
 }
 
