@@ -70,12 +70,21 @@ impl<T: Fold> Fold for Arc<T> {
     }
 }
 
-impl<T: Fold, U: Fold> Fold for (T, U) {
-    type Result = (T::Result, U::Result);
-    fn fold_with(&self, folder: &mut Folder, binders: usize) -> Result<Self::Result> {
-        Ok((self.0.fold_with(folder, binders)?, self.1.fold_with(folder, binders)?))
+macro_rules! tuple_fold {
+    ($($n:ident),*) => {
+        impl<$($n: Fold,)*> Fold for ($($n,)*) {
+            type Result = ($($n::Result,)*);
+            fn fold_with(&self, folder: &mut Folder, binders: usize) -> Result<Self::Result> {
+                let &($(ref $n),*) = self;
+                Ok(($($n.fold_with(folder, binders)?,)*))
+            }
+        }
     }
 }
+
+tuple_fold!(A, B);
+tuple_fold!(A, B, C);
+tuple_fold!(A, B, C, D);
 
 impl<T: Fold> Fold for Option<T> {
     type Result = Option<T::Result>;
@@ -159,12 +168,12 @@ impl Fold for Substitution {
 
 macro_rules! copy_fold {
     ($t:ty) => {
-        impl Fold for $t {
+        impl ::fold::Fold for $t {
             type Result = Self;
             fn fold_with(&self,
-                         _folder: &mut Folder,
+                         _folder: &mut ::fold::Folder,
                          _binders: usize)
-                         -> Result<Self::Result> {
+                         -> ::errors::Result<Self::Result> {
                 Ok(*self)
             }
         }
@@ -180,9 +189,12 @@ copy_fold!(QuantifierKind);
 
 macro_rules! enum_fold {
     ($s:ident [$($n:ident),*] { $($variant:ident($($name:ident),*)),* } $($w:tt)*) => {
-        impl<$($n),*> Fold for $s<$($n),*> $($w)* {
+        impl<$($n),*> ::fold::Fold for $s<$($n),*> $($w)* {
             type Result = $s<$($n :: Result),*>;
-            fn fold_with(&self, folder: &mut Folder, binders: usize) -> Result<Self::Result> {
+            fn fold_with(&self,
+                         folder: &mut ::fold::Folder,
+                         binders: usize)
+                         -> ::errors::Result<Self::Result> {
                 match *self {
                     $(
                         $s::$variant( $(ref $name),* ) => {
@@ -205,9 +217,12 @@ enum_fold!(Goal[] { Quantified(qkind, subgoal), Implies(wc, subgoal), And(g1, g2
 
 macro_rules! struct_fold {
     ($s:ident $([$($n:ident),*])* { $($name:ident),* } $($w:tt)*) => {
-        impl $(<$($n),*>)* Fold for $s $(<$($n),*>)* $($w)* {
+        impl $(<$($n),*>)* ::fold::Fold for $s $(<$($n),*>)* $($w)* {
             type Result = $s $(<$($n :: Result),*>)* ;
-            fn fold_with(&self, folder: &mut Folder, binders: usize) -> Result<Self::Result> {
+            fn fold_with(&self,
+                         folder: &mut ::fold::Folder,
+                         binders: usize)
+                         -> ::errors::Result<Self::Result> {
                 Ok($s {
                     $($name: self.$name.fold_with(folder, binders)?),*
                 })

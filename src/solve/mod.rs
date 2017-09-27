@@ -4,7 +4,7 @@ use ir::*;
 pub mod fulfill;
 pub mod infer;
 pub mod solver;
-// pub mod wfs;
+pub mod wfs;
 
 #[cfg(test)] mod test;
 
