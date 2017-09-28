@@ -139,6 +139,18 @@ struct StackEntry {
     /// e.g. when a direct subgoal completes. Otherwise, the minimums
     /// for the active computation are tracked in a local variable
     /// that is threaded around.
+    ///
+    /// Note that this field is an over-approximation. As described in
+    /// section 3.4.1 of EWFS, it actually stores the minimal
+    /// dependencies of this stack entry **and anything on top of it
+    /// in the stack**. In some cases, it can happen that this entry
+    /// on the stack does not depend on the things on top of it, in
+    /// which case the `link` is overapproximated -- this
+    /// overapproximation reflects the fact that, because of the
+    /// nature of a stack, we cannot in fact pop this entry until
+    /// those other entries are popped, even though there is no
+    /// *logical* dependency between us. This is the price we pay for
+    /// using such a simple data structure.
     link: Minimums,
 }
 
@@ -158,10 +170,11 @@ struct Table {
     /// bar(X)`.
     negatives: Vec<CanonicalExClause>,
 
-    /// True if this table has been COMPLETELY EVALUATED, meaning that
-    /// we have found all the answers that there are to find (and put
-    /// them in the `answers` set).
-    completely_evaluated: bool,
+    /// Stores the index of this table on the stack. This is only
+    /// `Some` until the table has been COMPLETELY EVALUATED -- i.e.,
+    /// all possible answers have been found -- at which point it is
+    /// set to `None`.
+    depth: Option<StackIndex>,
 }
 
 #[derive(Clone, Debug)]
@@ -208,7 +221,7 @@ struct ExClauseAnswer {
 struct_fold!(ExClauseAnswer { table_goal, delayed_literals });
 
 /// The `Minimums` structure is used to track the dependencies between
-/// some item E on the evaluation stack. In particular, tracks cases
+/// some item E on the evaluation stack. In particular, it tracks
 /// cases where the success of E depends (or may depend) on items
 /// deeper in the stack than E (i.e., with lower DFNs).
 ///
@@ -293,9 +306,11 @@ impl Forest {
 
     /// Pushes a new goal onto the stack, creating a table entry in the process.
     fn push_new_table(&mut self, goal: &CanonicalDomainGoal) -> StackIndex {
-        let table = self.tables.insert(goal);
+        let depth = self.stack.next_index();
         let dfn = self.dfn.next();
-        self.stack.push(table, dfn)
+        let table = self.tables.insert(goal, depth);
+        self.stack.push(table, dfn);
+        depth
     }
 
     /// This is SLG_SUBGOAL from EWFS.
@@ -371,7 +386,7 @@ impl Forest {
 
         // First, check if we have an existing table for this selected literal.
         let canonical_literal = infer.canonicalize(&selected_literal).quantified;
-        let index = match self.tables.index_of(&canonical_literal) {
+        let subgoal_table = match self.tables.index_of(&canonical_literal) {
             Some(i) => i,
             None => {
                 // If not, that's the easy case. Start a new table.
@@ -387,33 +402,41 @@ impl Forest {
             }
         };
 
-        // Otherwise, we have encountered a cycle. This is a bit
-        // tricky. We will start by registering ourselves to receive
-        // any new answers that will come later.
-        let pending_ex_clause = {
-            let Canonical {
-                binders,
-                value: (table_goal, selected_literal, delayed_literals, subgoals)
-            } = infer.canonicalize(&(
-                &ex_clause.table_goal,
-                &selected_literal,
-                &ex_clause.delayed_literals,
-                &ex_clause.subgoals
-            )).quantified;
+        // A table for this entry already exists. We want to take
+        // whatever answers we can find in the table -- bearing in
+        // mind that the table may still be in the process of being
+        // evaluated!
+        if let Some(subgoal_depth) = self.tables[subgoal_table].depth {
+            // If the table is not completely evaluated, then there is
+            // a cycle.  We'll still use whatever answers have been
+            // found so far, but we'll also register ourselves to
+            // receive any new answers that will come later.
+            let pending_ex_clause = {
+                let Canonical {
+                    binders,
+                    value: (table_goal, selected_literal, delayed_literals, subgoals)
+                } = infer.canonicalize(&(
+                    &ex_clause.table_goal,
+                    &selected_literal,
+                    &ex_clause.delayed_literals,
+                    &ex_clause.subgoals
+                )).quantified;
 
-            Canonical {
-                binders,
-                value: PendingExClause {
-                    goal_depth, table_goal, selected_literal, delayed_literals, subgoals
+                Canonical {
+                    binders,
+                    value: PendingExClause {
+                        goal_depth, table_goal, selected_literal, delayed_literals, subgoals
+                    }
                 }
-            }
-        };
-        self.tables[index].positives.push(pending_ex_clause);
+            };
+            self.tables[subgoal_table].positives.push(pending_ex_clause);
+            self.update_lookup(goal_depth, subgoal_depth, Sign::Positive, minimums);
+        }
 
         // Next, we will process the answers that have already been
         // found one by one.
         let mut new_ex_clauses = {
-            self.tables[index]
+            self.tables[subgoal_table]
                 .answers
                 .iter()
                 .flat_map(|answer| {
@@ -526,8 +549,8 @@ impl Forest {
                        subgoal_minimums: &Minimums)
     {
         let subgoal_table = self.stack[subgoal_depth].table;
-        if !self.tables[subgoal_table].completely_evaluated {
-            self.update_lookup(goal_depth, subgoal_depth, sign, minimums, subgoal_minimums);
+        if !self.tables[subgoal_table].completely_evaluated() {
+            self.update_lookup(goal_depth, subgoal_depth, sign, minimums);
         } else {
             self.stack[goal_depth].link.take_minimums(subgoal_minimums);
             minimums.take_minimums(subgoal_minimums);
@@ -540,13 +563,13 @@ impl Forest {
                      goal_depth: StackIndex,
                      subgoal_depth: StackIndex,
                      sign: Sign,
-                     minimums: &mut Minimums,
-                     subgoal_minimums: &Minimums)
+                     minimums: &mut Minimums)
     {
         match sign {
             Sign::Positive => {
-                self.stack[goal_depth].link.take_minimums(subgoal_minimums);
-                minimums.take_minimums(subgoal_minimums);
+                let subgoal_link = self.stack[subgoal_depth].link;
+                self.stack[goal_depth].link.take_minimums(&subgoal_link);
+                minimums.take_minimums(&subgoal_link);
             }
 
             Sign::Negative => {
@@ -824,12 +847,11 @@ impl Forest {
 }
 
 impl Stack {
-    fn len(&self) -> usize {
-        self.stack.len()
+    fn next_index(&self) -> StackIndex {
+        StackIndex { value: self.stack.len() }
     }
 
-    fn push(&mut self, table: TableIndex, dfn: DepthFirstNumber) -> StackIndex {
-        let len = self.len();
+    fn push(&mut self, table: TableIndex, dfn: DepthFirstNumber) {
         self.stack.push(StackEntry {
             table,
             dfn,
@@ -838,7 +860,6 @@ impl Stack {
                 negative: DepthFirstNumber::MAX,
             }
         });
-        StackIndex { value: len }
     }
 
     fn top(&self) -> &StackEntry {
@@ -861,13 +882,13 @@ impl IndexMut<StackIndex> for Stack {
 }
 
 impl Tables {
-    fn insert(&mut self, goal: &CanonicalDomainGoal) -> TableIndex {
+    fn insert(&mut self, goal: &CanonicalDomainGoal, depth: StackIndex) -> TableIndex {
         let index = TableIndex { value: self.tables.len() };
         self.tables.push(Table {
             answers: HashSet::new(),
             positives: vec![],
             negatives: vec![],
-            completely_evaluated: false,
+            depth: Some(depth),
         });
         self.table_indices.insert(goal.clone(), index);
         index
@@ -889,6 +910,12 @@ impl Index<TableIndex> for Tables {
 impl IndexMut<TableIndex> for Tables {
     fn index_mut(&mut self, index: TableIndex) -> &mut Table {
         &mut self.tables[index.value]
+    }
+}
+
+impl Table {
+    fn completely_evaluated(&self) -> bool {
+        self.depth.is_none()
     }
 }
 
