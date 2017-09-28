@@ -31,6 +31,7 @@ use ir::*;
 use ir::could_match::CouldMatch;
 use solve::infer::{InferenceTable, UnificationResult};
 use std::collections::{HashMap, HashSet};
+use std::cmp::min;
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;
 use std::usize;
@@ -79,6 +80,7 @@ struct Forest {
 }
 
 /// See `Forest`.
+#[derive(Default)]
 struct Tables {
     /// Maps from a canonical goal to the index of its table.
     table_indices: HashMap<CanonicalDomainGoal, TableIndex>,
@@ -89,6 +91,7 @@ struct Tables {
 }
 
 /// See `Forest`.
+#[derive(Default)]
 struct Stack {
     /// Stack: as described above, stores the in-progress goals.
     stack: Vec<StackEntry>,
@@ -101,19 +104,23 @@ struct TableIndex {
 
 copy_fold!(TableIndex);
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct StackIndex {
     value: usize
 }
 
+copy_fold!(StackIndex);
+
 struct StackEntry {
     /// The goal G from the stack entry `A :- G` represented here.
-    goal: InEnvironment<Goal>,
+    table: TableIndex,
 
-    /// XXX
-    pos_link: usize,
-
-    /// XXX
-    neg_link: usize,
+    /// Tracks the dependencies of this stack entry on things beneath
+    /// it in the stack. This field is updated "periodically",
+    /// e.g. when a direct subgoal completes. Otherwise, the minimums
+    /// for the active computation are tracked in a local variable
+    /// that is threaded around.
+    link: Minimums,
 }
 
 struct Table {
@@ -140,14 +147,20 @@ struct Table {
 
 #[derive(Clone, Debug)]
 struct PendingExClause {
-    table: TableIndex,
+    goal_depth: StackIndex,
     table_goal: InEnvironment<DomainGoal>,
     selected_literal: InEnvironment<DomainGoal>,
     delayed_literals: Vec<InEnvironment<DomainGoal>>,
     subgoals: Vec<InEnvironment<DomainGoal>>,
 }
 
-struct_fold!(PendingExClause { table, table_goal, selected_literal, delayed_literals, subgoals });
+struct_fold!(PendingExClause {
+    goal_depth,
+    table_goal,
+    selected_literal,
+    delayed_literals,
+    subgoals
+});
 
 /// The paper describes these as `A :- D | G`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -175,6 +188,36 @@ struct ExClauseAnswer {
 
 struct_fold!(ExClauseAnswer { table_goal, delayed_literals });
 
+/// The `Minimums` structure is used to track dependencies between
+/// items on the evaluation stack.
+///
+/// `positive` tracks the lowest index
+/// on the stack to which we had a POSITIVE dependency (e.g. `foo(X)
+/// :- bar(X)`). It is initialized with the index of the predicate on
+/// the stack. So imagine we have a stack like this:
+///
+/// ```
+/// 0 foo(X)   <-- bottom of stack
+/// 1 bar(X)
+/// 2 baz(X)   <-- top of stack
+/// ```
+///
+/// In this case, `positive` would be initially 0, 1, and 2 for `foo`,
+/// `bar`, and `baz` respectively. This reflects the fact that the
+/// answers for `foo(X)` depend on the answers for `foo(X)`. =)
+///
+/// Now imagine that we had a clause `baz(X) :- foo(X)`, inducing a
+/// cycle. In this case, we would update `positive` for `baz(X)` to be
+/// 0, reflecting the fact that its answers depend on the answers for
+/// `foo(X)`. Similarly, the minimum for `bar` would (eventually) be
+/// updated, since it too transitively depends on `foo`. `foo` is
+/// unaffected.
+///
+/// `negative` tracks the lowest index on the stack to which we had a
+/// NEGATIVE dependency: `foo(X) :- not { bar(X) }`. This is initially
+/// `usize::MAX`, reflecting the fact that the answers for `foo(X)` do
+/// not depend on `not(foo(X))`. When negative cycles are encountered,
+/// however, this value must be updated.
 #[derive(Copy, Clone)]
 struct Minimums {
     positive: usize,
@@ -186,6 +229,11 @@ struct SimplifiedGoals {
     negative: Vec<InEnvironment<DomainGoal>>,
 }
 
+enum Sign {
+    Positive,
+    Negative,
+}
+
 type CanonicalGoal = Canonical<InEnvironment<Goal>>;
 type CanonicalDomainGoal = Canonical<InEnvironment<DomainGoal>>;
 type CanonicalSubst = Canonical<ConstrainedSubst>;
@@ -194,43 +242,35 @@ type CanonicalExClauseAnswer = Canonical<ExClauseAnswer>;
 type CanonicalPendingExClause = Canonical<PendingExClause>;
 
 impl Forest {
-    //pub fn solve(program: &Arc<ProgramEnvironment>, goal: Goal) {
-    //    let program = program.clone();
-    //
-    //    // Initial program has no free variables, so it is canonical
-    //    // by definition, and it starts from an empty environment.
-    //    let canonical_goal = Canonical {
-    //        value: InEnvironment::empty(goal),
-    //        binders: vec![],
-    //    };
-    //
-    //    let mut table = HashMap::new();
-    //    table.insert(
-    //        canonical_goal.clone(),
-    //        Table {
-    //            answers: HashSet::new(),
-    //            positives: vec![],
-    //            negatives: vec![],
-    //            completely_evaluated: false,
-    //        });
-    //
-    //    let stack = vec![
-    //        //StackEntry {
-    //        //    goal: canonical_goal,
-    //        //    pos_link: 0,
-    //        //    neg_link: usize::MAX,
-    //        //}
-    //    ];
-    //
-    //    let mut forest = Forest { program, table, stack };
-    //
-    //    let mut minimums = Minimums { positive: 1, negative: usize::MAX };
-    //    forest.subgoal(&canonical_goal, &mut minimums)
-    //}
+    fn solve_root_domain_goal(program: &Arc<ProgramEnvironment>, goal: DomainGoal)
+                              -> HashSet<CanonicalExClauseAnswer> {
+        let program = program.clone();
+
+        let mut forest = Forest {
+            program: program.clone(),
+            tables: Tables::default(),
+            stack: Stack::default(),
+        };
+
+        // Initial program has no free variables, so it is canonical
+        // by definition, and it starts from an empty environment.
+        let canonical_goal = Canonical {
+            value: InEnvironment::empty(goal),
+            binders: vec![],
+        };
+
+        let root_table = forest.tables.push(&canonical_goal);
+        let root_table_depth = forest.stack.push(root_table);
+
+        let mut minimums = Minimums { positive: 1, negative: usize::MAX };
+        let _ = forest.subgoal(root_table_depth, &canonical_goal, &mut minimums);
+
+        forest.tables[root_table].answers.clone()
+    }
 
     /// This is SLG_SUBGOAL from EWFS.
     fn subgoal(&mut self,
-               table: TableIndex,
+               goal_depth: StackIndex,
                canonical_goal: &CanonicalDomainGoal,
                minimums: &mut Minimums)
                -> Result<()>
@@ -240,11 +280,11 @@ impl Forest {
         for clause in clauses {
             if let Ok(resolvent) = Self::resolvent_clause(canonical_goal, &clause.implication) {
                 // FIXME: we are ignoring fallback here. Have to think about that.
-                let _ = self.new_clause(table, &resolvent, minimums);
+                let _ = self.new_clause(goal_depth, &resolvent, minimums);
             }
         }
 
-        self.complete(table, minimums);
+        self.complete(goal_depth, minimums);
 
         Ok(())
     }
@@ -270,7 +310,7 @@ impl Forest {
     }
 
     fn new_clause(&mut self,
-                  table: TableIndex,
+                  goal_depth: StackIndex,
                   ex_clause: &CanonicalExClause, // Contains both A and G together.
                   minimums: &mut Minimums)
                   -> Result<()>
@@ -278,17 +318,17 @@ impl Forest {
         // Now we begin with SLG_NEWCLAUSE proper. What the text calls
         // G is basically the list of clauses in `goals`.
         if ex_clause.value.subgoals.is_empty() {
-            self.answer(table, ex_clause, minimums);
+            self.answer(goal_depth, ex_clause, minimums);
             Ok(())
         } else {
             // Here is where we *would* distinguish between positive/negative literals,
             // but I'm not worrying about negative cases yet.
-            self.positive(table, ex_clause, minimums)
+            self.positive(goal_depth, ex_clause, minimums)
         }
     }
 
     fn positive(&mut self,
-                table: TableIndex,
+                goal_depth: StackIndex,
                 ex_clause: &CanonicalExClause,
                 minimums: &mut Minimums)
                 -> Result<()>
@@ -305,13 +345,16 @@ impl Forest {
             Some(i) => i,
             None => {
                 // If not, that's the easy case. Start a new table.
-
-                // No table for `canonical_literal` yet.
-                // ...
-                // let minimums = &mut Minimums::new();
-                // self.subgoal(new_table_index, &canonical_subgoal, minimums);
-                // ...
-                unimplemented!();
+                let subgoal_table = self.tables.push(&canonical_literal);
+                let subgoal_depth = self.stack.push(subgoal_table);
+                let mut subgoal_minimums = self.stack.top().link;
+                self.subgoal(subgoal_depth, &canonical_literal, &mut subgoal_minimums);
+                self.update_solution(goal_depth,
+                                     subgoal_depth,
+                                     Sign::Positive,
+                                     minimums,
+                                     &mut subgoal_minimums);
+                return Ok(());
             }
         };
 
@@ -332,7 +375,7 @@ impl Forest {
             Canonical {
                 binders,
                 value: PendingExClause {
-                    table, table_goal, selected_literal, delayed_literals, subgoals
+                    goal_depth, table_goal, selected_literal, delayed_literals, subgoals
                 }
             }
         };
@@ -354,7 +397,7 @@ impl Forest {
         };
 
         for ex_clause in new_ex_clauses {
-            let _ = self.new_clause(table, &ex_clause, minimums);
+            let _ = self.new_clause(goal_depth, &ex_clause, minimums);
         }
 
         Ok(())
@@ -377,7 +420,7 @@ impl Forest {
     }
 
     fn answer(&mut self,
-              table: TableIndex,
+              goal_depth: StackIndex,
               ex_clause: &CanonicalExClause, // Contains both A and G together.
               minimums: &mut Minimums)
     {
@@ -408,22 +451,23 @@ impl Forest {
         };
 
         // If we've already seen this answer, we're done.
-        if self.tables[table].answers.contains(&canonical_answer) {
+        let goal_table = self.stack[goal_depth].table;
+        if self.tables[goal_table].answers.contains(&canonical_answer) {
             return;
         }
 
         // Otherwise, the answer is new, so insert it into our answer
         // set, and then find the people that are waiting and deliver
         // it to them.
-        self.tables[table].answers.insert(canonical_answer.clone());
+        self.tables[goal_table].answers.insert(canonical_answer.clone());
         if ex_clause.value.delayed_literals.is_empty() {
             // Clear out all the people waiting for negative results; we
             // have an answer now, so they have failed.
-            self.tables[table].negatives = vec![];
+            self.tables[goal_table].negatives = vec![];
 
             // Produce a list of people waiting for *positive* results.
             let mut list: Vec<_> =
-                self.tables[table]
+                self.tables[goal_table]
                 .positives
                 .iter()
                 .filter_map(|p| Self::resolvent_pending(p, &canonical_answer).ok())
@@ -435,6 +479,52 @@ impl Forest {
             }
         } else {
             unimplemented!("delayed literals")
+        }
+    }
+
+    /// Updates `minimums` to account for the dependencies of a
+    /// subgoal. Invoked when:
+    ///
+    /// - in the midst of solving `table`,
+    /// - `subgoal_table` was the selected literal,
+    /// - we invoked `subgoal()` and it returned,
+    /// - with `subgoal_minimums` as its "result".
+    fn update_solution(&mut self,
+                       goal_depth: StackIndex,
+                       subgoal_depth: StackIndex,
+                       sign: Sign,
+                       minimums: &mut Minimums,
+                       subgoal_minimums: &Minimums)
+    {
+        let subgoal_table = self.stack[subgoal_depth].table;
+        if !self.tables[subgoal_table].completely_evaluated {
+            self.update_lookup(goal_depth, subgoal_depth, sign, minimums, subgoal_minimums);
+        } else {
+            self.stack[goal_depth].link.take_minimums(subgoal_minimums);
+            minimums.take_minimums(subgoal_minimums);
+        }
+    }
+
+    /// Like `update_solution`, but invoked when `subgoal_table`
+    /// is known to be incomplete.
+    fn update_lookup(&mut self,
+                     goal_depth: StackIndex,
+                     subgoal_depth: StackIndex,
+                     sign: Sign,
+                     minimums: &mut Minimums,
+                     subgoal_minimums: &Minimums)
+    {
+        match sign {
+            Sign::Positive => {
+                self.stack[goal_depth].link.take_minimums(subgoal_minimums);
+                minimums.take_minimums(subgoal_minimums);
+            }
+
+            Sign::Negative => {
+                let subgoal_min = self.stack[subgoal_depth].link.minimum_of_pos_and_neg();
+                self.stack[goal_depth].link.take_negative_minimum(subgoal_min);
+                minimums.take_negative_minimum(subgoal_min);
+            }
         }
     }
 
@@ -472,12 +562,12 @@ impl Forest {
     /// answer and apply it to a previously blocked ex-clause.
     fn resolvent_pending(pending_ex_clause: &CanonicalPendingExClause,
                          answer: &CanonicalExClauseAnswer)
-                         -> Result<(TableIndex, CanonicalExClause)>
+                         -> Result<(StackIndex, CanonicalExClause)>
     {
         let mut infer = InferenceTable::new();
 
         let PendingExClause {
-            table,
+            goal_depth,
             table_goal,
             selected_literal,
             delayed_literals,
@@ -490,7 +580,8 @@ impl Forest {
             subgoals,
         };
 
-        Ok((table, Self::resolvent_answer(&mut infer, &ex_clause, &selected_literal, answer)?))
+        let resolvent = Self::resolvent_answer(&mut infer, &ex_clause, &selected_literal, answer)?;
+        Ok((goal_depth, resolvent))
     }
 
     /// Applies the SLG resolvent algorithm to incorporate an answer
@@ -698,6 +789,60 @@ impl Forest {
     }
 }
 
+impl Stack {
+    fn len(&self) -> usize {
+        self.stack.len()
+    }
+
+    fn push(&mut self, table: TableIndex) -> StackIndex {
+        let len = self.len();
+        self.stack.push(StackEntry {
+            table,
+            link: Minimums {
+                positive: len,
+                negative: usize::MAX,
+            }
+        });
+        StackIndex { value: len }
+    }
+
+    fn top(&self) -> &StackEntry {
+        self.stack.last().unwrap()
+    }
+}
+
+impl Index<StackIndex> for Stack {
+    type Output = StackEntry;
+
+    fn index(&self, index: StackIndex) -> &StackEntry {
+        &self.stack[index.value]
+    }
+}
+
+impl IndexMut<StackIndex> for Stack {
+    fn index_mut(&mut self, index: StackIndex) -> &mut StackEntry {
+        &mut self.stack[index.value]
+    }
+}
+
+impl Tables {
+    fn push(&mut self, goal: &CanonicalDomainGoal) -> TableIndex {
+        let index = TableIndex { value: self.tables.len() };
+        self.tables.push(Table {
+            answers: HashSet::new(),
+            positives: vec![],
+            negatives: vec![],
+            completely_evaluated: false,
+        });
+        self.table_indices.insert(goal.clone(), index);
+        index
+    }
+
+    fn index_of(&self, literal: &CanonicalDomainGoal) -> Option<TableIndex> {
+        self.table_indices.get(literal).cloned()
+    }
+}
+
 impl Index<TableIndex> for Tables {
     type Output = Table;
 
@@ -712,9 +857,19 @@ impl IndexMut<TableIndex> for Tables {
     }
 }
 
-impl Tables {
-    fn index_of(&self, literal: &CanonicalDomainGoal) -> Option<TableIndex> {
-        self.table_indices.get(literal).cloned()
+impl Minimums {
+    /// Update our fields to be the minimum of our current value
+    /// and the values from other.
+    fn take_minimums(&mut self, other: &Minimums) {
+        self.positive = min(self.positive, other.positive);
+        self.negative = min(self.negative, other.negative);
+    }
+
+    fn take_negative_minimum(&mut self, other: usize) {
+        self.negative = min(self.negative, other);
+    }
+
+    fn minimum_of_pos_and_neg(&self) -> usize {
+        min(self.positive, self.negative)
     }
 }
-
