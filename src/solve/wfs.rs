@@ -34,7 +34,6 @@ use std::collections::{HashMap, HashSet};
 use std::cmp::min;
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;
-use std::usize;
 
 pub fn solve(program: &Arc<ProgramEnvironment>, goal: Goal) {
     // Forest::solve(program, goal)
@@ -75,6 +74,7 @@ pub fn solve(program: &Arc<ProgramEnvironment>, goal: Goal) {
 ///     some complexity in the machine itself.)
 struct Forest {
     program: Arc<ProgramEnvironment>,
+    dfn: DepthFirstNumber,
     tables: Tables,
     stack: Stack,
 }
@@ -104,6 +104,10 @@ struct TableIndex {
 
 copy_fold!(TableIndex);
 
+/// The StackIndex identifies the position of a table's goal in the
+/// stack of goals that are actively being processed. Note that once a
+/// table is completely evaluated, it may be popped from the stack,
+/// and hence no longer have a stack index.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct StackIndex {
     value: usize
@@ -111,9 +115,24 @@ struct StackIndex {
 
 copy_fold!(StackIndex);
 
+/// The `DepthFirstNumber` (DFN) is a sequential number assigned to
+/// each goal when it is first encountered. The naming (taken from
+/// EWFS) refers to the idea that this number tracks the index of when
+/// we encounter the goal during a depth-first traversal of the proof
+/// tree.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DepthFirstNumber {
+    value: u64
+}
+
+copy_fold!(DepthFirstNumber);
+
 struct StackEntry {
     /// The goal G from the stack entry `A :- G` represented here.
     table: TableIndex,
+
+    /// The DFN of this computation.
+    dfn: DepthFirstNumber,
 
     /// Tracks the dependencies of this stack entry on things beneath
     /// it in the stack. This field is updated "periodically",
@@ -188,13 +207,16 @@ struct ExClauseAnswer {
 
 struct_fold!(ExClauseAnswer { table_goal, delayed_literals });
 
-/// The `Minimums` structure is used to track dependencies between
-/// items on the evaluation stack.
+/// The `Minimums` structure is used to track the dependencies between
+/// some item E on the evaluation stack. In particular, tracks cases
+/// cases where the success of E depends (or may depend) on items
+/// deeper in the stack than E (i.e., with lower DFNs).
 ///
-/// `positive` tracks the lowest index
-/// on the stack to which we had a POSITIVE dependency (e.g. `foo(X)
-/// :- bar(X)`). It is initialized with the index of the predicate on
-/// the stack. So imagine we have a stack like this:
+/// `positive` tracks the lowest index on the stack to which we had a
+/// POSITIVE dependency (e.g. `foo(X) :- bar(X)`) -- meaning that in
+/// order for E to succeed, the dependency must succeed. It is
+/// initialized with the index of the predicate on the stack. So
+/// imagine we have a stack like this:
 ///
 /// ```
 /// 0 foo(X)   <-- bottom of stack
@@ -214,14 +236,15 @@ struct_fold!(ExClauseAnswer { table_goal, delayed_literals });
 /// unaffected.
 ///
 /// `negative` tracks the lowest index on the stack to which we had a
-/// NEGATIVE dependency: `foo(X) :- not { bar(X) }`. This is initially
+/// NEGATIVE dependency (e.g., `foo(X) :- not { bar(X) }`) -- meaning
+/// that for E to succeed, the dependency must fail. This is initially
 /// `usize::MAX`, reflecting the fact that the answers for `foo(X)` do
 /// not depend on `not(foo(X))`. When negative cycles are encountered,
 /// however, this value must be updated.
 #[derive(Copy, Clone)]
 struct Minimums {
-    positive: usize,
-    negative: usize,
+    positive: DepthFirstNumber,
+    negative: DepthFirstNumber,
 }
 
 struct SimplifiedGoals {
@@ -247,6 +270,7 @@ impl Forest {
         let program = program.clone();
 
         let mut forest = Forest {
+            dfn: DepthFirstNumber::MIN,
             program: program.clone(),
             tables: Tables::default(),
             stack: Stack::default(),
@@ -259,13 +283,19 @@ impl Forest {
             binders: vec![],
         };
 
-        let root_table = forest.tables.push(&canonical_goal);
-        let root_table_depth = forest.stack.push(root_table);
-
-        let mut minimums = Minimums { positive: 1, negative: usize::MAX };
+        let root_table_depth = forest.push_new_table(&canonical_goal);
+        let root_table = forest.stack[root_table_depth].table;
+        let mut minimums = forest.stack[root_table_depth].link;
         let _ = forest.subgoal(root_table_depth, &canonical_goal, &mut minimums);
 
         forest.tables[root_table].answers.clone()
+    }
+
+    /// Pushes a new goal onto the stack, creating a table entry in the process.
+    fn push_new_table(&mut self, goal: &CanonicalDomainGoal) -> StackIndex {
+        let table = self.tables.insert(goal);
+        let dfn = self.dfn.next();
+        self.stack.push(table, dfn)
     }
 
     /// This is SLG_SUBGOAL from EWFS.
@@ -345,8 +375,7 @@ impl Forest {
             Some(i) => i,
             None => {
                 // If not, that's the easy case. Start a new table.
-                let subgoal_table = self.tables.push(&canonical_literal);
-                let subgoal_depth = self.stack.push(subgoal_table);
+                let subgoal_depth = self.push_new_table(&canonical_literal);
                 let mut subgoal_minimums = self.stack.top().link;
                 self.subgoal(subgoal_depth, &canonical_literal, &mut subgoal_minimums);
                 self.update_solution(goal_depth,
@@ -521,6 +550,11 @@ impl Forest {
             }
 
             Sign::Negative => {
+                // If `goal` depends on `not(subgoal)`, then for goal
+                // to succeed, `subgoal` must be completely
+                // evaluated. Therefore, `goal` depends (negatively)
+                // on the minimum link of `subgoal` as a whole -- it
+                // doesn't matter whether it's pos or neg.
                 let subgoal_min = self.stack[subgoal_depth].link.minimum_of_pos_and_neg();
                 self.stack[goal_depth].link.take_negative_minimum(subgoal_min);
                 minimums.take_negative_minimum(subgoal_min);
@@ -794,13 +828,14 @@ impl Stack {
         self.stack.len()
     }
 
-    fn push(&mut self, table: TableIndex) -> StackIndex {
+    fn push(&mut self, table: TableIndex, dfn: DepthFirstNumber) -> StackIndex {
         let len = self.len();
         self.stack.push(StackEntry {
             table,
+            dfn,
             link: Minimums {
-                positive: len,
-                negative: usize::MAX,
+                positive: dfn,
+                negative: DepthFirstNumber::MAX,
             }
         });
         StackIndex { value: len }
@@ -826,7 +861,7 @@ impl IndexMut<StackIndex> for Stack {
 }
 
 impl Tables {
-    fn push(&mut self, goal: &CanonicalDomainGoal) -> TableIndex {
+    fn insert(&mut self, goal: &CanonicalDomainGoal) -> TableIndex {
         let index = TableIndex { value: self.tables.len() };
         self.tables.push(Table {
             answers: HashSet::new(),
@@ -865,11 +900,23 @@ impl Minimums {
         self.negative = min(self.negative, other.negative);
     }
 
-    fn take_negative_minimum(&mut self, other: usize) {
+    fn take_negative_minimum(&mut self, other: DepthFirstNumber) {
         self.negative = min(self.negative, other);
     }
 
-    fn minimum_of_pos_and_neg(&self) -> usize {
+    fn minimum_of_pos_and_neg(&self) -> DepthFirstNumber {
         min(self.positive, self.negative)
     }
 }
+
+impl DepthFirstNumber {
+    const MIN: DepthFirstNumber = DepthFirstNumber { value: 0 };
+    const MAX: DepthFirstNumber = DepthFirstNumber { value: ::std::u64::MAX };
+
+    fn next(&mut self) -> DepthFirstNumber {
+        let value = self.value;
+        self.value += 1;
+        DepthFirstNumber { value }
+    }
+}
+
