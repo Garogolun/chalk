@@ -206,6 +206,7 @@ impl Debug for DomainGoal {
             DomainGoal::FromEnvTy(t) => write!(fmt, "FromEnv({:?})", t),
             DomainGoal::InScope(n) => write!(fmt, "InScope({:?})", n),
             DomainGoal::Derefs(n) => write!(fmt, "Derefs({:?})", n),
+            DomainGoal::ExternalTy(t) => write!(fmt, "ExternalTy({:?})", t),
         }
     }
 }

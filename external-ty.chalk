@@ -1,0 +1,8 @@
+extern trait Foo { }
+extern struct Bar { }
+extern struct Baz { }
+
+impl Foo for Bar { }
+
+extern trait Iterator { }
+extern struct String { }

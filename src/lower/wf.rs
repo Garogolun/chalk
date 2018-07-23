@@ -139,7 +139,8 @@ impl FoldInputTypes for DomainGoal {
             DomainGoal::FromEnv(..) |
             DomainGoal::WellFormedTy(..) |
             DomainGoal::FromEnvTy(..) |
-            DomainGoal::Derefs(..) => panic!("unexpected where clause"),
+            DomainGoal::Derefs(..) |
+            DomainGoal::ExternalTy(..) => panic!("unexpected where clause"),
 
             DomainGoal::InScope(..) => (),
         }

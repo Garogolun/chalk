@@ -537,7 +537,12 @@ pub enum DomainGoal {
     /// Derefs(T, U) :- Implemented(T: Deref<Target = U>)
     /// ```
     /// In Rust there are also raw pointers which can be deref'd but do not implement Deref.
-    Derefs(Derefs)
+    Derefs(Derefs),
+
+    /// A predicate which indicate whether a type is external (i.e. declared with the `extern`
+    /// keyword in Chalk). In Rust, this corresponds to a type defined in another crate. This
+    /// predicate is used to model coherence rules.
+    ExternalTy(Ty),
 }
 
 pub type QuantifiedDomainGoal = Binders<DomainGoal>;
